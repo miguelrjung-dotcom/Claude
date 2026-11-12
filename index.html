@@ -213,6 +213,7 @@ details[open] summary{margin-bottom:8px}
 </div></header>
 
 <main class="wrap" id="app"></main>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
 <nav class="nav"><div class="wrap" id="nav"></div></nav>
 
@@ -220,11 +221,11 @@ details[open] summary{margin-bottom:8px}
 /* =====================================================================
    Farmacologia Clínica — plataforma de estudos de Farmacologia (arquivo único)
    ---------------------------------------------------------------------
-   Conteúdo-base: objeto SEED abaixo. Conteúdo que a professora adiciona
-   pelo painel e todo o progresso ficam salvos no navegador (localStorage).
-   Para centralizar respostas de vários alunos num só lugar, troque o
-   objeto Store por um backend (ex.: Firebase/Supabase) — o resto do app
-   não precisa mudar.
+   Conteúdo-base: objeto SEED abaixo.
+   Sem configuração: tudo fica salvo no navegador (modo local).
+   Com CONFIG preenchido (Supabase): respostas dos alunos, feedbacks e
+   conteúdo adicionado pela professora ficam num banco online e chegam a
+   todos. Passo a passo em SETUP-SUPABASE.md.
    ===================================================================== */
 
 const SEED = { modules: [
@@ -405,15 +406,82 @@ const SEED = { modules: [
 }
 ]};
 
-/* ---------------- Persistência ---------------- */
+/* ---------------- Banco de dados online (Supabase) ---------------- */
+const CONFIG = {
+  SUPABASE_URL: "",       // ex.: "https://abcdefgh.supabase.co"
+  SUPABASE_ANON_KEY: ""   // chave "anon public" (Project Settings → API)
+};
+const CLOUD = !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_ANON_KEY && window.supabase);
+
+/* ---------------- Persistência local ---------------- */
 const KEY = "farmacomed:v1";
 const Store = {
   load(){ try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch(e){ return {}; } },
   save(state){ try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e){ toast("Não foi possível salvar neste navegador."); } }
 };
-const S = Object.assign({ student:null, pin:"1234", progress:{}, srs:{}, submissions:[], custom:{ modules:[], add:{} } }, Store.load());
-S.custom = Object.assign({ modules:[], add:{} }, S.custom);
+const S = Object.assign({ student:null, pin:"1234", progress:{}, srs:{}, submissions:[], rows:[], seen:{} }, Store.load());
+S.rows = S.rows || []; S.seen = S.seen || {}; delete S.custom;
 const save = () => Store.save(S);
+
+/* Conteúdo da professora = lista de linhas {id, kind, mid, data} → montado em `custom` */
+let custom = { modules:[], add:{} };
+function buildCustom(){
+  const c = { modules:[], add:{} };
+  S.rows.filter(r => r.kind === "module").forEach(r => c.modules.push({ icon:"book", ...r.data, id:r.id, custom:true, blocks:[...(r.data.blocks||[])], table:[], flashcards:[], objective:[], discursive:[] }));
+  S.rows.filter(r => r.kind !== "module").forEach(r => {
+    const it = { ...r.data, id:r.id }, cm = c.modules.find(m => m.id === r.mid);
+    if (cm) cm[r.kind === "rows" ? "table" : r.kind].push(it);
+    else { const a = c.add[r.mid] = c.add[r.mid] || {}; (a[r.kind] = a[r.kind] || []).push(it); }
+  });
+  custom = c;
+}
+buildCustom();
+
+/* Camada de nuvem */
+let sb = null, me = null, cloudReady = false, cloudError = null, lastRefresh = 0;
+const toRow = s => ({ student:s.student, mid:s.mid, mod_title:s.modTitle, qid:s.qid, level:s.level, case_text:s.case, question:s.question, answer:s.answer });
+const fromRow = r => ({ id:r.id, userId:r.user_id, student:r.student, mid:r.mid, modTitle:r.mod_title, qid:r.qid, level:r.level, case:r.case_text, question:r.question, answer:r.answer, status:r.status, feedback:r.feedback || "", ts:Date.parse(r.created_at), feedbackTs:r.feedback_at ? Date.parse(r.feedback_at) : null });
+const Cloud = {
+  async init(){
+    sb = window.supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, { auth:{ persistSession:true, storageKey:"farmacomed-auth" } });
+    let { data:{ session } } = await sb.auth.getSession();
+    if (!session) { const r = await sb.auth.signInAnonymously(); if (r.error) throw r.error; session = r.data.session; }
+    me = session.user;
+    if (!me.is_anonymous) { const r = await sb.rpc("is_teacher"); profOpen = !!r.data; }
+    await Promise.all([Cloud.loadContent(), Cloud.loadSubs()]);
+    cloudReady = true; cloudError = null; lastRefresh = Date.now();
+  },
+  async loadContent(){ const { data, error } = await sb.from("content").select("id,kind,mid,data,created_at").order("created_at"); if (error) throw error; S.rows = data; buildCustom(); save(); },
+  async loadSubs(){ const { data, error } = await sb.from("submissions").select("*").order("created_at", { ascending:false }); if (error) throw error; S.submissions = data.map(fromRow); if (!S.student) { const own = S.submissions.find(x => me && x.userId === me.id); if (own) S.student = own.student; } save(); },
+  async submit(s){ const { data, error } = await sb.from("submissions").insert(toRow(s)).select().single(); if (error) throw error; return fromRow(data); },
+  async feedback(id, fb){ const { data, error } = await sb.from("submissions").update({ feedback:fb, status:"corrigida", feedback_at:new Date().toISOString() }).eq("id", id).select().single(); if (error) throw error; return fromRow(data); },
+  async addRow(r){ const { error } = await sb.from("content").insert(r); if (error) throw error; },
+  async delRows(ids){ const { error } = await sb.from("content").delete().in("id", ids); if (error) throw error; },
+  async teacherLogin(email, password){
+    const { data, error } = await sb.auth.signInWithPassword({ email, password }); if (error) throw error;
+    me = data.user; const r = await sb.rpc("is_teacher");
+    if (!r.data) { await Cloud.logout(); throw new Error("not_teacher"); }
+    profOpen = true; await Cloud.loadSubs();
+  },
+  async logout(){
+    await sb.auth.signOut(); profOpen = false; S.submissions = [];
+    const r = await sb.auth.signInAnonymously(); me = r.data?.user || null;
+    await Cloud.loadSubs().catch(() => {});
+  }
+};
+function refresh(force){
+  if (!CLOUD || !cloudReady || (!force && Date.now() - lastRefresh < 5000)) return;
+  lastRefresh = Date.now(); Cloud.loadSubs().then(render).catch(() => {});
+}
+async function addRow(kind, mid, data){
+  const row = { id:uid(), kind, mid:mid || null, data };
+  if (CLOUD) await Cloud.addRow(row);
+  S.rows.push(row); buildCustom(); save(); return row;
+}
+async function removeRows(ids){
+  try { if (CLOUD) await Cloud.delRows(ids); S.rows = S.rows.filter(r => !ids.includes(r.id)); buildCustom(); save(); render(); toast("Excluído"); }
+  catch(e){ toast("Erro ao excluir: " + (e.message || e)); }
+}
 
 /* ---------------- Utilitários ---------------- */
 const DAY = 86400000;
@@ -440,8 +508,8 @@ const ICONS = {
 
 /* ---------------- Conteúdo (base + adições da professora) ---------------- */
 function modules(){
-  return [...SEED.modules, ...S.custom.modules].map(m => {
-    const a = S.custom.add[m.id] || {};
+  return [...SEED.modules, ...custom.modules].map(m => {
+    const a = custom.add[m.id] || {};
     return { ...m,
       blocks:[...(m.blocks||[]), ...(a.blocks||[])],
       table:[...(m.table||[]), ...(a.rows||[])],
@@ -451,17 +519,6 @@ function modules(){
   });
 }
 const getMod = id => modules().find(m => m.id === id);
-function addTo(mid, kind, item){
-  if (S.custom.modules.some(m => m.id === mid)) {
-    const m = S.custom.modules.find(m => m.id === mid);
-    const k = kind === "rows" ? "table" : kind; (m[k] = m[k] || []).push(item);
-  } else {
-    const a = S.custom.add[mid] = S.custom.add[mid] || {};
-    (a[kind] = a[kind] || []).push(item);
-  }
-  save();
-}
-
 /* ---------------- Progresso & repetição espaçada ---------------- */
 function prog(m){
   const p = S.progress[m.id] || {};
@@ -493,7 +550,7 @@ function rateCard(id, r){
   c.reps++; if (r === "errei") c.lapses++;
   c.last = r; S.srs[id] = c; save();
 }
-const mySubs = () => S.submissions.filter(s => s.student === S.student);
+const mySubs = () => CLOUD ? S.submissions.filter(s => me && s.userId === me.id) : S.submissions.filter(s => s.student === S.student);
 const pendingCount = () => S.submissions.filter(s => s.status === "pendente").length;
 
 /* ---------------- Router ---------------- */
@@ -517,10 +574,11 @@ function nav(view){
   document.getElementById("nav").innerHTML =
     it("#/","home","Início", !view || view==="m") +
     it("#/revisar","cards","Revisar", view==="revisar", due) +
-    it("#/respostas","inbox","Respostas", view==="respostas", mySubs().filter(s=>s.status==="corrigida" && !s.seen).length) +
+    it("#/respostas","inbox","Respostas", view==="respostas", mySubs().filter(s=>s.status==="corrigida" && !S.seen[s.id]).length) +
     it("#/prof","shield","Professora", view==="prof", pend);
 }
-window.addEventListener("hashchange", () => { FS = null; render(); window.scrollTo(0,0); });
+window.addEventListener("hashchange", () => { FS = null; render(); window.scrollTo(0,0); refresh(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
 /* ---------------- Telas ---------------- */
 function vHome(){
@@ -554,7 +612,7 @@ function vHome(){
       </div>
     </a>`; }).join("")}
   </div>
-  <p class="faint xs" style="margin:24px 0 8px;text-align:center">Seu progresso fica salvo neste dispositivo.</p>`;
+  <p class="faint xs" style="margin:24px 0 8px;text-align:center">${CLOUD ? (cloudReady ? "● Conectado à turma — respostas vão direto para a professora" : cloudError ? "Sem conexão com a turma — tente recarregar" : "Conectando à turma…") : "Modo local: progresso salvo neste dispositivo"}</p>`;
 }
 
 function vModule(m, tab){
@@ -701,10 +759,10 @@ const discForm = (m,q,dk) => `<div style="margin-top:12px">
 
 /* ---- Minhas respostas ---- */
 function vAnswers(){
-  if (!S.student) return `<h1 class="display" style="font-size:27px;margin:20px 0 14px">Minhas respostas</h1>
+  if (!S.student && !CLOUD) return `<h1 class="display" style="font-size:27px;margin:20px 0 14px">Minhas respostas</h1>
     <div class="card empty"><div class="big">👤</div><p>Identifique-se para ver suas respostas.</p><button class="btn primary" data-act="askName">Informar meu nome</button></div>`;
   const subs = mySubs().sort((a,b) => b.ts - a.ts);
-  subs.forEach(s => { if (s.status === "corrigida") s.seen = true; }); save();
+  subs.forEach(s => { if (s.status === "corrigida") S.seen[s.id] = true; }); save();
   return `<h1 class="display" style="font-size:27px;margin:20px 0 14px">Minhas respostas</h1>
   <div class="stack">${subs.length ? subs.map(s => `
     <article class="card">
@@ -720,6 +778,13 @@ function vAnswers(){
 
 /* ---- Área da professora ---- */
 function vProf(){
+  if (!profOpen && CLOUD) return `
+    <div class="prof-head"><h1 class="display" style="font-size:24px">Área da Professora</h1><p style="margin:4px 0 0;opacity:.85" class="small">Entre com sua conta para corrigir e gerenciar conteúdo.</p></div>
+    <form class="card stack" style="margin-top:16px" data-form="tlogin">
+      <div><label class="f" for="tem">E-mail</label><input class="input" id="tem" name="email" type="email" autocomplete="username" required></div>
+      <div><label class="f" for="tpw">Senha</label><input class="input" id="tpw" name="password" type="password" autocomplete="current-password" required></div>
+      <button class="btn primary block" ${cloudReady ? "" : "disabled"}>${cloudReady ? "Entrar" : "Conectando…"}</button>
+    </form>`;
   if (!profOpen) return `
     <div class="prof-head"><h1 class="display" style="font-size:24px">Área da Professora</h1><p style="margin:4px 0 0;opacity:.85" class="small">Gestão de conteúdo e correção das respostas.</p></div>
     <form class="card" style="margin-top:16px" data-form="pin">
@@ -745,6 +810,7 @@ function pSubs(){
       <details style="margin-top:10px"><summary>Ver caso clínico</summary><div class="case" style="margin-top:0">${md(s.case)}</div><p class="small"><b>${md(s.question)}</b></p></details>
       <label class="f" style="margin-top:12px">Resposta do aluno</label>
       <div class="answer-box">${esc(s.answer)}</div>
+      ${(() => { const q = modules().flatMap(m => m.discursive).find(q => q.id === s.qid); s = { ...s, key: q?.key || s.key }; return ""; })()}
       ${s.key ? `<details style="margin-top:10px"><summary>Gabarito / pontos esperados</summary><div class="answer-box">${md(s.key)}</div></details>` : ""}
       <label class="f" for="${dk}" style="margin-top:12px">Feedback para o aluno</label>
       <textarea id="${dk}" data-draft="${dk}" placeholder="Corrija o raciocínio clínico, aponte acertos e lacunas…">${esc(drafts[dk] ?? s.feedback ?? "")}</textarea>
@@ -793,32 +859,29 @@ function pAdd(){
   </form>`;
 }
 function pContent(){
-  const rows = [];
-  const label = {flashcards:"Flashcard", objective:"Objetiva", discursive:"Caso clínico", blocks:"Destaque", rows:"Tabela", table:"Tabela"};
-  const txt = (k, it) => it.front || it.stem || it.case || it.text || it.drug || "";
-  S.custom.modules.forEach(m => rows.push(`<div class="list-item"><div><span class="tag">Módulo</span> <strong>${esc(m.title)}</strong></div><button class="btn sm danger" data-act="delMod" data-id="${esc(m.id)}">Excluir</button></div>`));
-  modules().forEach(m => {
-    const src = S.custom.modules.find(c => c.id === m.id) || S.custom.add[m.id] || {};
-    ["objective","discursive","flashcards","blocks","rows","table"].forEach(k => (src[k]||[]).forEach(it => {
-      if (k === "blocks" && it.type === "lead") return;
-      rows.push(`<div class="list-item"><div class="small"><span class="tag">${label[k]}</span> <span class="faint">${esc(m.title)}</span><br>${esc(txt(k,it).slice(0,110))}</div><button class="btn sm danger" data-act="delItem" data-m="${esc(m.id)}" data-k="${k}" data-id="${esc(it.id)}">Excluir</button></div>`);
-    }));
+  const label = { module:"Módulo", flashcards:"Flashcard", objective:"Objetiva", discursive:"Caso clínico", blocks:"Destaque", rows:"Tabela" };
+  const items = S.rows.map(r => {
+    const d = r.data, txt = r.kind === "module" ? d.title : (d.front || d.stem || d.case || d.text || d.drug || "");
+    return `<div class="list-item"><div class="small"><span class="tag">${label[r.kind] || r.kind}</span> ${r.kind === "module" ? "" : `<span class="faint">${esc(getMod(r.mid)?.title || "")}</span>`}<br>${esc(String(txt).slice(0,110))}</div><button class="btn sm danger" data-act="delRow" data-id="${esc(r.id)}">Excluir</button></div>`;
   });
   return `<div class="card"><h3 style="font-size:17px;margin-bottom:6px">Conteúdo adicionado por você</h3>
     <p class="muted small" style="margin:0 0 8px">O conteúdo-base do app não aparece aqui e não pode ser excluído pelo painel.</p>
-    ${rows.join("") || `<p class="faint small">Nada adicionado ainda.</p>`}</div>`;
+    ${items.join("") || `<p class="faint small">Nada adicionado ainda.</p>`}</div>`;
 }
 function pSettings(){
   return `<div class="stack">
-    <form class="card stack" data-form="newpin"><h3 style="font-size:17px">Trocar PIN</h3>
+    ${CLOUD ? `<div class="card stack"><h3 style="font-size:17px">Banco de dados online</h3>
+      <p class="muted small" style="margin:0">● Conectado. Respostas dos alunos, seus feedbacks e o conteúdo que você adiciona ficam no Supabase e chegam a toda a turma.</p>
+      <p class="faint xs" style="margin:0">Conta: ${esc(me?.email || "")}</p></div>`
+    : `<form class="card stack" data-form="newpin"><h3 style="font-size:17px">Trocar PIN</h3>
       <input class="input" name="pin" type="password" inputmode="numeric" minlength="4" required placeholder="Novo PIN (mín. 4 dígitos)">
       <button class="btn block">Salvar PIN</button></form>
-    <div class="card stack"><h3 style="font-size:17px">Backup</h3>
-      <p class="muted small" style="margin:0">Exporte seu conteúdo e as respostas para guardar ou levar a outro dispositivo.</p>
-      <button class="btn block" data-act="export">Exportar backup (.json)</button>
-      <label class="btn block">Importar backup<input type="file" accept="application/json" id="importFile" hidden></label></div>
     <div class="card stack"><h3 style="font-size:17px">Onde os dados ficam</h3>
-      <p class="muted small" style="margin:0">Nesta versão piloto, tudo é salvo <b>no navegador deste dispositivo</b>. Respostas enviadas pelo celular de um aluno não chegam automaticamente ao seu. Para isso, é preciso ligar o app a um banco de dados online.</p></div>
+      <p class="muted small" style="margin:0">Modo local: tudo fica <b>no navegador deste dispositivo</b>. Para receber as respostas da turma, configure o banco online (SETUP-SUPABASE.md).</p></div>`}
+    <div class="card stack"><h3 style="font-size:17px">Backup</h3>
+      <p class="muted small" style="margin:0">Exporte o conteúdo adicionado e as respostas para guardar uma cópia.</p>
+      <button class="btn block" data-act="export">Exportar backup (.json)</button>
+      ${CLOUD ? "" : `<label class="btn block">Importar backup<input type="file" accept="application/json" id="importFile" hidden></label>`}</div>
     <div class="card stack"><h3 style="font-size:17px">Zona de cuidado</h3>
       <button class="btn block danger" data-act="resetContent">Apagar conteúdo adicionado por mim</button></div>
   </div>`;
@@ -870,32 +933,40 @@ const ACT = {
   submitDisc: el => {
     const dk = "d_" + el.dataset.q, text = (drafts[dk] || "").trim();
     if (text.length < 10) return toast("Escreva sua resposta antes de enviar.");
-    const go = () => {
+    const go = async () => {
       const m = getMod(el.dataset.m), q = m.discursive.find(x => x.id === el.dataset.q);
-      S.submissions.push({ id:uid(), student:S.student, mid:m.id, modTitle:m.title, qid:q.id, level:q.level, case:q.case, question:q.question, key:q.key||"", answer:text, ts:Date.now(), status:"pendente", feedback:"" });
-      delete drafts[dk]; save(); render(); toast("Resposta enviada para avaliação da professora ✓");
+      let sub = { id:uid(), student:S.student, mid:m.id, modTitle:m.title, qid:q.id, level:q.level, case:q.case, question:q.question, answer:text, ts:Date.now(), status:"pendente", feedback:"" };
+      el.disabled = true; el.textContent = "Enviando…";
+      try { if (CLOUD) sub = await Cloud.submit(sub); }
+      catch(e){ el.disabled = false; el.textContent = "Enviar resposta para correção"; return toast("Não foi possível enviar. Verifique a internet e tente de novo."); }
+      S.submissions.unshift(sub); delete drafts[dk]; save(); render(); toast("Resposta enviada para avaliação da professora ✓");
     };
     S.student ? go() : askName(go);
   },
   profTab: el => { profTab = el.dataset.k; render(); },
   subFilter: el => { subFilter = el.dataset.k; render(); },
-  saveFb: el => {
+  saveFb: async el => {
     const s = S.submissions.find(x => x.id === el.dataset.id), dk = "fb_" + s.id;
     const v = (drafts[dk] ?? s.feedback ?? "").trim();
     if (!v) return toast("Escreva o feedback antes de salvar.");
-    s.feedback = v; s.status = "corrigida"; s.feedbackTs = Date.now(); s.seen = false; delete drafts[dk]; save(); render(); toast("Feedback salvo ✓");
+    el.disabled = true;
+    try {
+      if (CLOUD) Object.assign(s, await Cloud.feedback(s.id, v));
+      else Object.assign(s, { feedback:v, status:"corrigida", feedbackTs:Date.now() });
+    } catch(e){ el.disabled = false; return toast("Erro ao salvar: " + (e.message || e)); }
+    delete S.seen[s.id]; delete drafts[dk]; save(); render(); toast("Feedback salvo ✓");
   },
-  logoutProf: () => { profOpen = false; render(); },
-  delMod: el => { if (!confirm("Excluir este módulo e todo o conteúdo dele?")) return; S.custom.modules = S.custom.modules.filter(m => m.id !== el.dataset.id); delete S.custom.add[el.dataset.id]; save(); render(); },
-  delItem: el => {
-    const src = S.custom.modules.find(c => c.id === el.dataset.m) || S.custom.add[el.dataset.m];
-    src[el.dataset.k] = (src[el.dataset.k]||[]).filter(i => i.id !== el.dataset.id); save(); render(); toast("Excluído");
+  logoutProf: async () => { if (CLOUD) await Cloud.logout().catch(() => {}); else profOpen = false; render(); },
+  delRow: el => {
+    const id = el.dataset.id, row = S.rows.find(r => r.id === id);
+    if (row?.kind === "module" && !confirm("Excluir este módulo e todo o conteúdo dele?")) return;
+    removeRows([id, ...S.rows.filter(r => r.mid === id).map(r => r.id)]);
   },
   export: () => {
-    const blob = new Blob([JSON.stringify({ app:"farmacomed", v:1, exported:new Date().toISOString(), custom:S.custom, submissions:S.submissions }, null, 2)], {type:"application/json"});
+    const blob = new Blob([JSON.stringify({ app:"farmacomed", v:2, exported:new Date().toISOString(), rows:S.rows, submissions:S.submissions }, null, 2)], {type:"application/json"});
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "farmacomed-backup-" + new Date().toISOString().slice(0,10) + ".json"; a.click(); URL.revokeObjectURL(a.href);
   },
-  resetContent: () => { if (!confirm("Apagar todo o conteúdo que você adicionou? As respostas dos alunos são mantidas.")) return; S.custom = { modules:[], add:{} }; save(); render(); toast("Conteúdo adicionado apagado"); }
+  resetContent: () => { if (!confirm("Apagar todo o conteúdo que você adicionou? As respostas dos alunos são mantidas.")) return; removeRows(S.rows.map(r => r.id)); }
 };
 document.addEventListener("click", e => {
   const el = e.target.closest("[data-act]"); if (!el || !ACT[el.dataset.act]) return;
@@ -911,7 +982,7 @@ document.addEventListener("change", e => {
     r.onload = () => {
       try {
         const d = JSON.parse(r.result); if (d.app !== "farmacomed") throw 0;
-        S.custom = Object.assign({ modules:[], add:{} }, d.custom);
+        const have = new Set(S.rows.map(r => r.id)); (d.rows||[]).forEach(r => { if (!have.has(r.id)) S.rows.push(r); }); buildCustom();
         const ids = new Set(S.submissions.map(s => s.id));
         (d.submissions||[]).forEach(s => { if (!ids.has(s.id)) S.submissions.push(s); });
         save(); render(); toast("Backup importado ✓");
@@ -920,34 +991,45 @@ document.addEventListener("change", e => {
     r.readAsText(e.target.files[0]);
   }
 });
-document.addEventListener("submit", e => {
+document.addEventListener("submit", async e => {
   const f = e.target.dataset?.form; if (!f || f === "name") return;
   e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); const t = s => (s||"").trim();
+  const btn = e.target.querySelector("button.primary, button:last-of-type");
   if (f === "pin") { if (d.pin === S.pin) { profOpen = true; render(); } else toast("PIN incorreto."); return; }
+  if (f === "tlogin") {
+    if (btn) { btn.disabled = true; btn.textContent = "Entrando…"; }
+    try { await Cloud.teacherLogin(t(d.email), d.password); render(); }
+    catch(err){ toast(err.message === "not_teacher" ? "Esta conta não está cadastrada como professora." : "E-mail ou senha incorretos."); render(); }
+    return;
+  }
   if (f === "newpin") { if (t(d.pin).length < 4) return toast("Use pelo menos 4 dígitos."); S.pin = t(d.pin); save(); e.target.reset(); toast("PIN atualizado ✓"); return; }
   if (f === "add") {
-    const id = uid();
-    if (addType === "module") {
-      S.custom.modules.push({ id, title:t(d.title), subtitle:t(d.subtitle), color:d.color||COLORS[2], icon:"book", custom:true,
-        blocks: t(d.lead) ? [{ type:"lead", text:t(d.lead), id:uid() }] : [], table:[], flashcards:[], objective:[], discursive:[] });
-      save(); addModule = id; addType = "objective"; toast("Módulo criado ✓ — agora adicione conteúdo a ele"); render(); return;
-    }
+    let kind, data;
+    if (addType === "module") { kind = "module"; data = { title:t(d.title), subtitle:t(d.subtitle), color:d.color || COLORS[2], icon:"book", blocks: t(d.lead) ? [{ type:"lead", text:t(d.lead) }] : [] }; }
     if (addType === "objective") {
       const options = [], map = [];
       for (let k = 0; k < 5; k++) if (t(d["opt"+k])) { map[k] = options.length; options.push({ text:t(d["opt"+k]), fb:t(d["fb"+k]) }); }
       if (options.length < 2) return toast("Preencha ao menos 2 alternativas.");
       if (map[+d.correct] === undefined) return toast("A alternativa marcada como correta está vazia.");
-      addTo(addModule, "objective", { id, stem:t(d.stem), options, correct:map[+d.correct] });
+      kind = "objective"; data = { stem:t(d.stem), options, correct:map[+d.correct] };
     }
-    if (addType === "discursive") addTo(addModule, "discursive", { id, level:d.level, case:t(d.case), question:t(d.question), key:t(d.key) });
-    if (addType === "flashcard") addTo(addModule, "flashcards", { id, front:t(d.front), back:t(d.back) });
-    if (addType === "callout") addTo(addModule, "blocks", { id, type:"callout", variant:d.variant, title:d.variant==="clinica"?"Atenção clínica":"Cai em prova", text:t(d.text) });
-    if (addType === "row") addTo(addModule, "rows", { id, drug:t(d.drug), mech:t(d.mech), ae:t(d.ae), care:t(d.care) });
-    e.target.reset(); toast("Adicionado ao módulo ✓"); render();
+    if (addType === "discursive") { kind = "discursive"; data = { level:d.level, case:t(d.case), question:t(d.question), key:t(d.key) }; }
+    if (addType === "flashcard") { kind = "flashcards"; data = { front:t(d.front), back:t(d.back) }; }
+    if (addType === "callout") { kind = "blocks"; data = { type:"callout", variant:d.variant, title:d.variant === "clinica" ? "Atenção clínica" : "Cai em prova", text:t(d.text) }; }
+    if (addType === "row") { kind = "rows"; data = { drug:t(d.drug), mech:t(d.mech), ae:t(d.ae), care:t(d.care) }; }
+    if (btn) btn.disabled = true;
+    try {
+      const row = await addRow(kind, kind === "module" ? null : addModule, data);
+      if (kind === "module") { addModule = row.id; addType = "objective"; toast("Módulo criado ✓ — agora adicione conteúdo a ele"); }
+      else { e.target.reset(); toast("Adicionado ao módulo ✓"); }
+    } catch(err){ toast("Erro ao salvar: " + (err.message || err)); }
+    render();
   }
 });
 
 render();
+if (CONFIG.SUPABASE_URL && !window.supabase) toast("Não foi possível carregar o banco online. Usando modo local.");
+if (CLOUD) Cloud.init().then(render).catch(err => { console.error(err); cloudError = err.message || String(err); toast("Sem conexão com a turma — usando dados salvos."); render(); });
 </script>
 </body>
 </html>

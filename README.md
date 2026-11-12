@@ -16,5 +16,9 @@ Plataforma de estudos de Farmacologia para estudantes de Medicina, em um único 
 ## Como usar
 Abra `index.html` no navegador, ou publique pelo GitHub Pages (Settings → Pages → branch `main`, pasta `/`).
 
-## Limitação da versão piloto
-Os dados ficam salvos no navegador de cada dispositivo (localStorage). Respostas enviadas pelo celular de um aluno não chegam automaticamente ao dispositivo da professora. Para uso real com a turma, é preciso conectar um banco de dados online — o código já isola a persistência no objeto `Store`.
+## Banco de dados online
+Sem configuração, o site roda em **modo local** (cada aparelho guarda só os próprios dados).
+Para as respostas dos alunos chegarem à professora e o conteúdo novo aparecer para todos, ligue ao Supabase: siga **SETUP-SUPABASE.md** (≈10 min) e rode `supabase-setup.sql`.
+
+- Aluno: acesso sem login (identidade anônima no aparelho); vê só as próprias respostas.
+- Professora: login por e-mail e senha; vê e corrige todas as respostas e adiciona conteúdo.
